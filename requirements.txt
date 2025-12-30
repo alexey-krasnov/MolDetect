@@ -11,4 +11,4 @@ easyocr>=1.6.2
 timm>=0.4.12,<=0.5.4
 transformers>=4.5.1,<4.48.0
 # Uncomment to install Molscribe if it's not yet installed.
-# MolScribe @ git+https://github.com/alexey-krasnov/MolScribe
+MolScribe @ git+https://github.com/alexey-krasnov/MolScribe
