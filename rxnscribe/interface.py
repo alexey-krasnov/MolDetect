@@ -158,7 +158,7 @@ class RxnScribe:
             plt.close(fig)
         return results
 
-    def draw_predictions_combined(self, predictions, image=None, image_file=None):
+    def draw_predictions_combined(self, predictions, image=None, image_file=None, show=False):
         assert image or image_file
         data = ReactionImageData(predictions=predictions, image=image, image_file=image_file)
         h, w = np.array([data.height, data.width]) * 10 / max(data.height, data.width)
@@ -178,6 +178,8 @@ class RxnScribe:
         canvas.draw()
         buf = canvas.buffer_rgba()
         result_image = np.asarray(buf)
+        if show:
+            plt.show()
         plt.close(fig)
         return result_image
 
