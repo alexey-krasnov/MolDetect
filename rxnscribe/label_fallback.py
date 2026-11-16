@@ -1,137 +1,149 @@
 """
 Layout + OCR fallback for molecule labels that the MolDetect coref decoder misses.
 
-The decoder reliably finds the [Mol] box on single-structure patent images
-(e.g. EP2209374B1_D0057.tif) but never emits an [Idt] box for large serif
-captions such as "EC0575". The caption sits in whitespace directly below the
-molecule box, so we find it from pixels and read it with OCR.
+The decoder reliably finds [Mol] boxes on patent images but often emits no [Idt]
+box for captions such as "EC0575" (single structure) or Roman numerals "XXIX"
+(reaction schemes), and sometimes pairs a molecule with a wrong "label" (e.g. "HCl").
+
+Approach:
+  1. drop existing [Idt] boxes whose OCR text is clearly not a label (e.g. "HCl");
+  2. OCR the whole page, keep label-like tokens (digits, 2a, EC0575, Roman numerals);
+  3. match tokens to unlabelled molecules one-to-one by geometry (label below the
+     molecule, horizontally aligned), cheapest pairs first.
 
 Usage:
-    preds = model.predict_image(img, coref=True)            # img = ORIGINAL image
+    preds = model.predict_image(img, coref=True, ocr=True)   # img = ORIGINAL image
     preds = add_missing_labels(preds, img, ocr=model.ocr_model)
+
+`ocr` is an easyocr.Reader, or a callable(np.ndarray RGB) -> [(x1, y1, x2, y2, text), ...].
 """
 import re
 import numpy as np
-from PIL import Image
 
-# e.g. 030, 2a, EC0575, CPD-12, Compound 5, I-12
-LABEL_RE = re.compile(r'^(?:(?:compound|cpd\.?|example|ex\.?)\s*)?[A-Za-z]{0,4}[-\s]?\d{1,5}[A-Za-z]?(?:\(\w+\))?$', re.I)
+MOL, IDT = 1, 3
 
-IDT = 3
-MOL = 1
-
-
-def _ink_mask(gray, thr=170):
-    return gray < thr
-
-
-def _bands(profile, gap):
-    """Split a boolean 1-D profile into [start, end) runs, merging runs closer than `gap`."""
-    idx = np.flatnonzero(profile)
-    if idx.size == 0:
-        return []
-    runs, s, p = [], idx[0], idx[0]
-    for i in idx[1:]:
-        if i - p > gap:
-            runs.append((s, p + 1))
-            s = i
-        p = i
-    runs.append((s, p + 1))
-    return runs
+# 030, 2a, 5-b, EC0575, CPD-12, "Compound 5"
+LABEL_RE = re.compile(r'^(?:(?:compound|cpd\.?|example|ex\.?)\s*)?[A-Za-z]{0,4}-?\d{1,5}[A-Za-z]?(?:\(\w+\))?$', re.I)
+# valid Roman numerals, case-sensitive (so "Cl" is not "CI")
+ROMAN_RE = re.compile(r'^(?=[IVXLCDM])M{0,3}(?:CM|CD|D?C{0,3})(?:XC|XL|L?X{0,3})(?:IX|IV|V?I{0,3})$')
+# chemical annotation, not a label: CH3, NH2, HCl, H3C, OH ...
+ATOM_RE = re.compile(r'^(?:(?:Cl|Br|[CHNOSPFI])\d*)+$')
+# substituent placeholders inside structures: R, R1, R2, Ra ... (not compound labels)
+RGROUP_RE = re.compile(r'^R\d*[a-z]?$')
 
 
-def _default_ocr(ocr, crop_rgb):
-    """Return recognized text for a crop. `ocr` is an easyocr.Reader, a callable(np.ndarray)->str, or None."""
-    if ocr is None:
-        return ''
-    if callable(ocr):
-        return ocr(crop_rgb)
-    # easyocr.Reader; restrict the alphabet — captions are alphanumeric
-    out = ocr.readtext(crop_rgb, detail=0, paragraph=False,
-                       allowlist='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-() .')
-    return ' '.join(out)
+def normalize(text):
+    t = text.strip().strip(',:;')
+    # OCR often reads the last I of a Roman numeral as l / | / 1
+    if re.fullmatch(r'[IVXl|1]+', t) and re.search('[VX]', t):
+        t = re.sub(r'[l|1]', 'I', t)
+    elif re.fullmatch(r'[Il|]{2,}', t):          # "Il", "lI", "||" -> "II" (digits like "11" stay)
+        t = 'I' * len(t)
+    return t
 
 
-def find_caption_below(gray, mol_box, other_mol_boxes=(), max_gap_frac=0.35, max_height_frac=0.45):
-    """
-    Locate the first ink line below `mol_box` (pixel xyxy). Returns pixel xyxy or None.
-    The search is bounded by the image bottom and by the top of any molecule below.
-    """
-    H, W = gray.shape
-    x1, y1, x2, y2 = [int(round(v)) for v in mol_box]
-    mw, mh = x2 - x1, y2 - y1
-    sx1, sx2 = max(0, int(x1 - 0.25 * mw)), min(W, int(x2 + 0.25 * mw))
-    sy1 = max(0, y2 - max(1, int(0.02 * mh)))
-    sy2 = min(H, y2 + int(max_height_frac * mh))
-    for ox1, oy1, ox2, oy2 in other_mol_boxes:       # stop above the next structure
-        if oy1 > y2 and ox1 < sx2 and ox2 > sx1:
-            sy2 = min(sy2, int(oy1))
-    if sy2 - sy1 < 4:
-        return None
-
-    ink = _ink_mask(gray[sy1:sy2, sx1:sx2])
-    rows = _bands(ink.any(axis=1), gap=max(2, int(0.01 * mh)))
-    if not rows:
-        return None
-    r0, r1 = rows[0]
-    # first band must start reasonably close to the molecule
-    if r0 > max_gap_frac * mh:
-        return None
-    line = ink[r0:r1]
-    # columns: merge letters of one caption (gap ~ a few glyph heights)
-    glyph_h = r1 - r0
-    cols = _bands(line.any(axis=0), gap=max(4, int(1.5 * glyph_h)))
-    if not cols:
-        return None
-    # choose the column group closest to the molecule's horizontal centre
-    cx = (x1 + x2) / 2 - sx1
-    c0, c1 = min(cols, key=lambda c: abs((c[0] + c[1]) / 2 - cx))
-    return sx1 + c0, sy1 + r0, sx1 + c1, sy1 + r1
+def is_label(text):
+    t = normalize(text)
+    if not t or len(t) > 12:
+        return False
+    if ROMAN_RE.match(t):
+        return len(t) >= 2 or t in ('I', 'V', 'X')
+    if ATOM_RE.match(t) and (re.search(r'[H\d]', t)):
+        return False
+    if RGROUP_RE.match(t):
+        return False
+    return bool(LABEL_RE.match(t))
 
 
-def _read(image_rgb, box, ocr, pad=8, scale=3):
-    x1, y1, x2, y2 = box
-    H, W = image_rgb.shape[:2]
-    crop = image_rgb[max(0, y1 - pad):min(H, y2 + pad), max(0, x1 - pad):min(W, x2 + pad)]
-    # white margin + upscale helps OCR on tight crops
-    im = Image.fromarray(crop).convert('RGB')
-    im = im.resize((im.width * scale, im.height * scale), Image.LANCZOS)
-    canvas = Image.new('RGB', (im.width + 40, im.height + 40), (255, 255, 255))
-    canvas.paste(im, (20, 20))
-    return _default_ocr(ocr, np.asarray(canvas)).strip()
+def is_junk(text):
+    """Clearly NOT a label: empty, or a chemical annotation such as HCl, CH3, NH2 (OCR may read HCl as HCI).
+    Deliberately narrow: unusual but valid labels (A, 3aa, A-1-1, E3.1, (IV)) must never be dropped."""
+    t = normalize(text)
+    return not t or bool(ATOM_RE.match(t) and 'H' in t)
 
 
-def add_missing_labels(predictions, image, ocr=None, label_re=LABEL_RE):
+def _page_words(ocr, rgb, min_conf=0.2, margin=40):
+    """-> list of (x1, y1, x2, y2, text) in original-image pixels.
+    A white margin is added first: captions touching the scan edge are otherwise missed."""
+    padded = np.pad(rgb, ((margin, margin), (margin, margin), (0, 0)), constant_values=255)
+    if hasattr(ocr, 'readtext'):                       # easyocr.Reader
+        words = []
+        for poly, text, conf in ocr.readtext(padded, detail=1, paragraph=False):
+            if conf < min_conf:
+                continue
+            xs, ys = [p[0] for p in poly], [p[1] for p in poly]
+            words.append((min(xs), min(ys), max(xs), max(ys), text))
+    else:
+        words = list(ocr(padded))
+    return [(x1 - margin, y1 - margin, x2 - margin, y2 - margin, t) for x1, y1, x2, y2, t in words]
+
+
+def add_missing_labels(predictions, image, ocr, max_below=0.6, x_margin=0.15):
     """
     predictions: output of MolDetect.predict_image(..., coref=True)
     image:       the same PIL image that was passed to the model
-    ocr:         easyocr.Reader (model.ocr_model) or callable(np.ndarray)->str
-    Adds an [Idt] bbox with 'text' and a coref pair for every molecule that has no label.
-    Returns a new predictions dict.
+    Returns a new predictions dict with wrong pairs removed and missing [Idt] boxes added.
     """
+    W, H = image.size
     rgb = np.asarray(image.convert('RGB'))
-    gray = np.asarray(image.convert('L'))
-    H, W = gray.shape
     bboxes = [dict(b) for b in predictions['bboxes']]
     corefs = [list(c) for c in predictions['corefs']]
 
-    mols = [i for i, b in enumerate(bboxes) if b['category_id'] == MOL]
-    labelled = {c[0] for c in corefs}
-    px = lambda b: (b['bbox'][0] * W, b['bbox'][1] * H, b['bbox'][2] * W, b['bbox'][3] * H)
-    mol_px = {i: px(bboxes[i]) for i in mols}
+    # 1. drop [Idt] boxes whose text is clearly junk (e.g. "HCl") and their pairs; keep anything else
+    drop = {i for i, b in enumerate(bboxes)
+            if b['category_id'] == IDT and b.get('text') and is_junk(' '.join(b['text']))}
+    if drop:
+        remap, kept = {}, []
+        for i, b in enumerate(bboxes):
+            if i not in drop:
+                remap[i] = len(kept)
+                kept.append(b)
+        corefs = [[remap[m], remap[t]] for m, t in corefs if m in remap and t in remap]
+        bboxes = kept
 
-    for i in mols:
-        if i in labelled:
+    px = lambda b: (b['bbox'][0] * W, b['bbox'][1] * H, b['bbox'][2] * W, b['bbox'][3] * H)
+    mols = {i: px(b) for i, b in enumerate(bboxes) if b['category_id'] == MOL}
+    idts = [px(b) for b in bboxes if b['category_id'] == IDT]
+    labelled = {m for m, _ in corefs}
+    todo = [i for i in mols if i not in labelled]
+    if not todo:
+        return {'bboxes': bboxes, 'corefs': corefs}
+
+    # 2. label-like OCR tokens that are not inside a molecule or an existing [Idt]
+    cands = []
+    for x1, y1, x2, y2, text in _page_words(ocr, rgb):
+        t = normalize(text)
+        if not is_label(t):
             continue
-        others = [v for k, v in mol_px.items() if k != i]
-        box = find_caption_below(gray, mol_px[i], others)
-        if box is None:
+        cx, cy, lh = (x1 + x2) / 2, (y1 + y2) / 2, max(y2 - y1, 1)
+        if any(a <= cx <= c and b <= cy <= d for a, b, c, d in idts):
             continue
-        text = _read(rgb, box, ocr)
-        if not text or not label_re.match(text):
+        # inside a molecule (allow the bottom edge: the model box sometimes swallows the caption)
+        if any(a <= cx <= c and b <= cy <= d - lh for a, b, c, d in mols.values()):
             continue
-        x1, y1, x2, y2 = box
-        bboxes.append({'category': '[Idt]', 'category_id': IDT, 'text': [text],
+        cands.append((t, (x1, y1, x2, y2)))
+
+    # 3. one-to-one matching, cheapest first: caption below the molecule, horizontally aligned
+    pairs = []
+    for i in todo:
+        mx1, my1, mx2, my2 = mols[i]
+        mw, mh = max(mx2 - mx1, 1), max(my2 - my1, 1)
+        for j, (t, (x1, y1, x2, y2)) in enumerate(cands):
+            cx, cy, lh = (x1 + x2) / 2, (y1 + y2) / 2, max(y2 - y1, 1)
+            if not (mx1 - x_margin * mw <= cx <= mx2 + x_margin * mw):
+                continue
+            if not (my2 - 1.2 * lh <= cy <= my2 + max_below * mh):
+                continue
+            cost = abs(cy - my2) / mh + 0.5 * abs(cx - (mx1 + mx2) / 2) / mw
+            pairs.append((cost, i, j))
+    used_m, used_c = set(), set()
+    for cost, i, j in sorted(pairs):
+        if i in used_m or j in used_c:
+            continue
+        used_m.add(i)
+        used_c.add(j)
+        t, (x1, y1, x2, y2) = cands[j]
+        bboxes.append({'category': '[Idt]', 'category_id': IDT, 'text': [t],
                        'bbox': (float(x1) / W, float(y1) / H, float(x2) / W, float(y2) / H),
                        'score': -1, 'source': 'fallback'})
         corefs.append([i, len(bboxes) - 1])
