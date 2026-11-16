@@ -10,6 +10,7 @@ from matplotlib.backends.backend_agg import FigureCanvasAgg
 from .pix2seq import build_pix2seq_model
 from .tokenizer import get_tokenizer
 from .dataset import make_transforms
+from .label_fallback import add_missing_labels
 from .data import postprocess_reactions, postprocess_bboxes, postprocess_coref_results, ReactionImageData, ImageData, CorefImageData
 
 from molscribe import MolScribe
@@ -272,7 +273,7 @@ class MolDetect:
         reader = easyocr.Reader(['en'], gpu =True)
         return reader
     
-    def predict_images(self, input_images: List, batch_size = 16, molscribe = False, coref = False, ocr = False):
+    def predict_images(self, input_images: List, batch_size = 16, molscribe = False, coref = False, ocr = False, label_fallback = False):
         device = self.device
         if not coref:
             tokenizer = self.tokenizer['bbox']
@@ -289,24 +290,27 @@ class MolDetect:
                 bboxes = tokenizer.sequence_to_data(seqs.tolist(), scores.tolist(), scale=refs[i]['scale'])
                 if coref: 
                     bboxes = postprocess_coref_results(bboxes, image = input_images[i], molscribe = self.molscribe if molscribe else None, ocr = self.ocr_model if ocr else None)
+                    if label_fallback:
+                        # decoder missed identifiers: find captions below molecules via layout + OCR
+                        bboxes = add_missing_labels(bboxes, input_images[i], ocr = self.ocr_model)
                 if not coref:
                     bboxes = postprocess_bboxes(bboxes, image = input_images[i], molscribe = self.molscribe if molscribe else None)
                 predictions.append(bboxes)
         return predictions
 
-    def predict_image(self, image, molscribe = False, coref = False, ocr = False):
-        predictions = self.predict_images([image], molscribe = molscribe, coref = coref, ocr = ocr)
+    def predict_image(self, image, molscribe = False, coref = False, ocr = False, label_fallback = False):
+        predictions = self.predict_images([image], molscribe = molscribe, coref = coref, ocr = ocr, label_fallback = label_fallback)
         return predictions[0]
 
-    def predict_image_files(self, image_files: List, batch_size = 16, molscribe = False, coref = False, ocr = False):
+    def predict_image_files(self, image_files: List, batch_size = 16, molscribe = False, coref = False, ocr = False, label_fallback = False):
         input_images = []
         for path in image_files:
             image = PIL.Image.open(path).convert("RGB")
             input_images.append(image)
-        return self.predict_images(input_images, batch_size = batch_size, molscribe = molscribe, coref = coref, ocr = ocr)
+        return self.predict_images(input_images, batch_size = batch_size, molscribe = molscribe, coref = coref, ocr = ocr, label_fallback = label_fallback)
 
-    def predict_image_file(self, image_file: str, molscribe = False, coref = False, ocr = False, **kwargs):
-        predictions = self.predict_image_files([image_file], molscribe = molscribe, coref = coref, ocr = ocr)
+    def predict_image_file(self, image_file: str, molscribe = False, coref = False, ocr = False, label_fallback = False, **kwargs):
+        predictions = self.predict_image_files([image_file], molscribe = molscribe, coref = coref, ocr = ocr, label_fallback = label_fallback)
         return predictions[0]
     
     def draw_bboxes(self, predictions, image=None, image_file=None, coref = False):
